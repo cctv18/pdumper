@@ -87,23 +87,14 @@ index b430d8951287..92de6d9e733b 100644
  /**
   * ufshcd_queuecommand - main entry point for SCSI requests
   * @host: SCSI host pointer
-@@ -2971,6 +3014,23 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
+@@ -2971,6 +3014,14 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
  		goto out;
  	ufshcd_send_command(hba, tag, hwq);
  
 +#ifdef CONFIG_PSTORE_BLK
-+	/* * 在 Panic 且 UFS 还在工作时，立即轮询。
-+	* 注意：这段代码必须放在 phy_dump.c 中的 submit_raw_bio 触发之后执行。
-+	*/
++	/* 在 Panic 触发且 UFS 还在工作时，立即轮询 */
 +	if (unlikely(oops_in_progress)) {
-+		/* * 注意：6.6 代码在此处并未持有显式的 RCU 锁，
-+		 * 因此不需要像 6.1 那样调用 rcu_read_unlock()，
-+		 * 可以直接进入轮询: 
-+		 */
 +		ufshcd_panic_poll(hba, tag, cmd);
-+		/* * 返回 0 告诉 SCSI 层命令已成功入队
-+		 * 实际上我们已经在上方 ufshcd_panic_poll 中调用 scsi_done 完成了它
-+		 */
 +		return 0;
 +	}
 +#endif
@@ -159,13 +150,10 @@ index a80b0619757a..a70689903246 100644
  }
  
  /*
-@@ -337,6 +347,13 @@ static int __init pstore_blk_init(void)
+@@ -337,6 +347,10 @@ static int __init pstore_blk_init(void)
  {
  	int ret;
  
-+	/* * 修改点：插入 phy_dump_init_hijack。
-+	 * 作用：在 pstore 初始化前探测分区，修改 blkdev 变量。
-+	 */
 +#ifdef CONFIG_PSTORE_BLK
 +	phy_dump_init_hijack(blkdev, sizeof(blkdev));
 +#endif
@@ -173,13 +161,10 @@ index a80b0619757a..a70689903246 100644
  	mutex_lock(&pstore_blk_lock);
  	ret = __best_effort_init();
  	mutex_unlock(&pstore_blk_lock);
-@@ -351,6 +368,12 @@ static void __exit pstore_blk_exit(void)
+@@ -351,6 +368,9 @@ static void __exit pstore_blk_exit(void)
  	__best_effort_exit();
  	/* If we've been asked to unload, unregister any remaining device. */
  	__unregister_pstore_device(pstore_device_info);
-+	/* * 修改点：插入 phy_dump_exit_hijack。
-+	 * 作用：释放劫持时打开的额外设备句柄，防止泄漏。
-+	 */
 +#ifdef CONFIG_PSTORE_BLK
 +	phy_dump_exit_hijack();
 +#endif
@@ -201,15 +186,12 @@ index ea1b4e116389..33af3d13393b 100644
  /*
   * Mutex protects:
   * 1) List of modules (also safely readable with preempt_disable),
-@@ -2883,6 +2887,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
+@@ -2883,6 +2887,10 @@ static int load_module(struct load_info *info, const char __user *uargs,
  	bool module_allocated = false;
  	long err = 0;
  	char *after_dashes;
 +	
 +#ifdef CONFIG_PSTORE_BLK
-+	/* * 强制等待 phy-dump 完成初始化（包括 UFS 探测和分区劫持）。
-+	* 这保证了没有任何模块能在 Pstore 物理转储准备好之前加载。
-+	*/
 +	phy_dump_wait_for_ready();
 +#endif
  
