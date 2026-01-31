@@ -1,0 +1,240 @@
+diff --git a/block/partitions/core.c b/block/partitions/core.c
+index ef7697567cbc..fe0938e065fb 100644
+--- a/block/partitions/core.c
++++ b/block/partitions/core.c
+@@ -374,6 +374,11 @@ static struct block_device *add_partition(struct gendisk *disk, int partno,
+ 		bdev->bd_meta_info = kmemdup(info, sizeof(*info), GFP_KERNEL);
+ 		if (!bdev->bd_meta_info)
+ 			goto out_put;
++#ifdef CONFIG_PSTORE_BLK
++		/* 打印带有 PARTLABEL (info->volname) 的分区信息 */
++		pr_info("phy-dump-debug: Found Partition: Disk=%s Part=%d Name='%s' UUID=%s\n",
++			disk->disk_name, partno, info->volname, info->uuid);
++#endif
+ 	}
+ 
+ 	/* delay uevent until 'holders' subdir is created */
+@@ -409,6 +414,11 @@ static struct block_device *add_partition(struct gendisk *disk, int partno,
+ 	kobject_put(bdev->bd_holder_dir);
+ 	device_del(pdev);
+ out_put:
++#ifdef CONFIG_PSTORE_BLK
++	/* 打印无 PARTLABEL 的分区信息 */
++	pr_info("phy-dump-debug: Found Partition: Disk=%s Part=%d (No Label)\n",
++		disk->disk_name, partno);
++#endif
+ 	put_device(pdev);
+ 	return ERR_PTR(err);
+ out_put_disk:
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index b430d8951287..92de6d9e733b 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -36,6 +36,7 @@
+ #include "ufs_bsg.h"
+ #include "ufshcd-crypto.h"
+ #include <asm/unaligned.h>
++#include <ufs/ufshci.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/ufs.h>
+@@ -2873,6 +2874,48 @@ static void ufshcd_init_lrb(struct ufs_hba *hba, struct ufshcd_lrb *lrb, int i)
+ 	lrb->ucd_prdt_dma_addr = cmd_desc_element_addr + prdt_offset;
+ }
+ 
++#ifdef CONFIG_PSTORE_BLK
++
++#define UFS_PANIC_POLL_RETRIES 10000000
++
++/* * 静态辅助函数：Panic 时的死循环轮询 
++ * 作用：在中断禁用时，手动检查 Doorbell 寄存器位，确认命令完成
++ */
++static void ufshcd_panic_poll(struct ufs_hba *hba, int tag, struct scsi_cmnd *cmd)
++{
++	int i;
++	u32 doorbell;
++	bool completed = false;
++	
++	/* 仅输出一次警告，避免刷屏 */
++	static bool logged = false;
++	if (!logged) {
++		pr_emerg("phy-dump: UFS panic poll trigger! Tag: %d\n", tag);
++		logged = true;
++	}
++
++	for (i = 0; i < UFS_PANIC_POLL_RETRIES; i++) {
++		/* 读取 Doorbell 寄存器 */
++		doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
++		/* 检查对应 tag 位是否清零 (0表示完成) */
++		if (!(doorbell & (1 << tag))) {
++			completed = true;
++			break;
++		}
++		udelay(1); /* 微秒级延迟 */
++	}
++
++	if (completed) {
++		set_host_byte(cmd, DID_OK);
++		scsi_done(cmd); /* 手动触发 SCSI 完成回调 */
++	} else {
++		pr_emerg("phy-dump: UFS poll timed out! Tag: %d\n", tag);
++		set_host_byte(cmd, DID_TIME_OUT);
++		scsi_done(cmd);
++	}
++}
++#endif /* CONFIG_PSTORE_BLK */
++
+ /**
+  * ufshcd_queuecommand - main entry point for SCSI requests
+  * @host: SCSI host pointer
+@@ -2971,6 +3014,23 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
+ 		goto out;
+ 	ufshcd_send_command(hba, tag, hwq);
+ 
++#ifdef CONFIG_PSTORE_BLK
++	/* * 在 Panic 且 UFS 还在工作时，立即轮询。
++	* 注意：这段代码必须放在 phy_dump.c 中的 submit_raw_bio 触发之后执行。
++	*/
++	if (unlikely(oops_in_progress)) {
++		/* * 注意：6.6 代码在此处并未持有显式的 RCU 锁，
++		 * 因此不需要像 6.1 那样调用 rcu_read_unlock()，
++		 * 可以直接进入轮询: 
++		 */
++		ufshcd_panic_poll(hba, tag, cmd);
++		/* * 返回 0 告诉 SCSI 层命令已成功入队
++		 * 实际上我们已经在上方 ufshcd_panic_poll 中调用 scsi_done 完成了它
++		 */
++		return 0;
++	}
++#endif
++
+ out:
+ 	if (ufs_trigger_eh()) {
+ 		unsigned long flags;
+diff --git a/fs/pstore/Makefile b/fs/pstore/Makefile
+index c270467aeece..9120a6de90ad 100644
+--- a/fs/pstore/Makefile
++++ b/fs/pstore/Makefile
+@@ -17,4 +17,4 @@ pstore_zone-objs += zone.o
+ obj-$(CONFIG_PSTORE_ZONE)	+= pstore_zone.o
+ 
+ pstore_blk-objs += blk.o
+-obj-$(CONFIG_PSTORE_BLK)	+= pstore_blk.o
++obj-$(CONFIG_PSTORE_BLK)	+= pstore_blk.o phy-dump.o
+diff --git a/fs/pstore/blk.c b/fs/pstore/blk.c
+index a80b0619757a..a70689903246 100644
+--- a/fs/pstore/blk.c
++++ b/fs/pstore/blk.c
+@@ -19,6 +19,8 @@
+ #include <linux/init_syscalls.h>
+ #include <linux/mount.h>
+ 
++#include <linux/phy/phy-dump.h>
++
+ static long kmsg_size = CONFIG_PSTORE_BLK_KMSG_SIZE;
+ module_param(kmsg_size, long, 0400);
+ MODULE_PARM_DESC(kmsg_size, "kmsg dump record size in kbytes");
+@@ -187,16 +189,24 @@ EXPORT_SYMBOL_GPL(unregister_pstore_device);
+ 
+ static ssize_t psblk_generic_blk_read(char *buf, size_t bytes, loff_t pos)
+ {
++#ifdef CONFIG_PSTORE_BLK
++	return phy_dump_read(psblk_file, buf, bytes, pos);
++#else
+ 	return kernel_read(psblk_file, buf, bytes, &pos);
++#endif
+ }
+ 
+ static ssize_t psblk_generic_blk_write(const char *buf, size_t bytes,
+ 		loff_t pos)
+ {
++#ifdef CONFIG_PSTORE_BLK
++	return phy_dump_write(psblk_file, buf, bytes, pos);
++#else
+ 	/* Console/Ftrace backend may handle buffer until flush dirty zones */
+ 	if (in_interrupt() || irqs_disabled())
+ 		return -EBUSY;
+ 	return kernel_write(psblk_file, buf, bytes, &pos);
++#endif
+ }
+ 
+ /*
+@@ -337,6 +347,13 @@ static int __init pstore_blk_init(void)
+ {
+ 	int ret;
+ 
++	/* * 修改点：插入 phy_dump_init_hijack。
++	 * 作用：在 pstore 初始化前探测分区，修改 blkdev 变量。
++	 */
++#ifdef CONFIG_PSTORE_BLK
++	phy_dump_init_hijack(blkdev, sizeof(blkdev));
++#endif
++
+ 	mutex_lock(&pstore_blk_lock);
+ 	ret = __best_effort_init();
+ 	mutex_unlock(&pstore_blk_lock);
+@@ -351,6 +368,12 @@ static void __exit pstore_blk_exit(void)
+ 	__best_effort_exit();
+ 	/* If we've been asked to unload, unregister any remaining device. */
+ 	__unregister_pstore_device(pstore_device_info);
++	/* * 修改点：插入 phy_dump_exit_hijack。
++	 * 作用：释放劫持时打开的额外设备句柄，防止泄漏。
++	 */
++#ifdef CONFIG_PSTORE_BLK
++	phy_dump_exit_hijack();
++#endif
+ 	mutex_unlock(&pstore_blk_lock);
+ }
+ module_exit(pstore_blk_exit);
+diff --git a/kernel/module/main.c b/kernel/module/main.c
+index ea1b4e116389..33af3d13393b 100644
+--- a/kernel/module/main.c
++++ b/kernel/module/main.c
+@@ -66,6 +66,10 @@
+ #undef CREATE_TRACE_POINTS
+ #include <trace/hooks/module.h>
+ 
++#ifdef CONFIG_PSTORE_BLK
++#include <linux/phy/phy-dump.h>
++#endif
++
+ /*
+  * Mutex protects:
+  * 1) List of modules (also safely readable with preempt_disable),
+@@ -2883,6 +2887,13 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 	bool module_allocated = false;
+ 	long err = 0;
+ 	char *after_dashes;
++	
++#ifdef CONFIG_PSTORE_BLK
++	/* * 强制等待 phy-dump 完成初始化（包括 UFS 探测和分区劫持）。
++	* 这保证了没有任何模块能在 Pstore 物理转储准备好之前加载。
++	*/
++	phy_dump_wait_for_ready();
++#endif
+ 
+ 	/*
+ 	 * Do the signature check (if any) first. All that
+diff --git a/kernel/panic.c b/kernel/panic.c
+index d7973e975474..4faa3a6ec5fc 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -37,6 +37,7 @@
+ #include <linux/context_tracking.h>
+ #include <trace/events/error_report.h>
+ #include <asm/sections.h>
++#include <linux/phy/phy-dump.h>
+ 
+ #define PANIC_TIMER_STEP 100
+ #define PANIC_BLINK_SPD 18
+@@ -366,6 +367,10 @@ void panic(const char *fmt, ...)
+ 	 */
+ 	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
+ 
++#ifdef CONFIG_PSTORE_BLK
++	phy_dump_panic_pre_stop();
++#endif
++
+ 	panic_print_sys_info(false);
+ 
+ 	kmsg_dump(KMSG_DUMP_PANIC);
